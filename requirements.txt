@@ -1,0 +1,8 @@
+zeroconf
+pycryptodome
+av
+sounddevice
+numpy
+customtkinter
+pystray
+pillow
