@@ -1,1 +1,54 @@
 
+name: Build Windows exe
+
+on:
+  workflow_dispatch:        # ручной запуск кнопкой на вкладке Actions
+  push:
+    tags: ["v*"]            # или автоматически при создании тега, например v1.0
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build app with window (WindowsAirPlay.exe)
+        run: >
+          python -m PyInstaller --onefile --noconsole --name WindowsAirPlay
+          --icon icon.ico
+          --collect-all customtkinter --collect-all av --collect-all sounddevice
+          --collect-all zeroconf --hidden-import pystray._win32
+          --add-data "airport_key.pem;." app.py
+
+      - name: Build console version (AirPlayReceiver.exe)
+        run: >
+          python -m PyInstaller --onefile --name AirPlayReceiver
+          --icon icon.ico
+          --collect-all av --collect-all sounddevice --collect-all zeroconf
+          --add-data "airport_key.pem;." airplay_audio.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: WindowsAirPlay
+          path: |
+            dist/WindowsAirPlay.exe
+            dist/AirPlayReceiver.exe
+
+      - name: Attach to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/WindowsAirPlay.exe
+            dist/AirPlayReceiver.exe
