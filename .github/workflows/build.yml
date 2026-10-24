@@ -1,10 +1,9 @@
-
 name: Build Windows exe
 
 on:
-  workflow_dispatch:        # ручной запуск кнопкой на вкладке Actions
+  workflow_dispatch:
   push:
-    tags: ["v*"]            # или автоматически при создании тега, например v1.0
+    tags: ["v*"]
 
 permissions:
   contents: write
