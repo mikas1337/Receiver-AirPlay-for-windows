@@ -512,11 +512,19 @@ async def serve(name):
     ip = local_ip()
     try:
         server = await asyncio.start_server(handle, "0.0.0.0", PORT)
-    except OSError as e:
-        msg = f"Не удалось занять порт {PORT}: {e}. Возможно, приёмник уже запущен."
-        log(msg)
-        emit("error", msg)
-        return
+    except OSError:
+        # Порт 5000 часто занят другими программами. Это не проблема: телефон узнаёт порт
+        # из mDNS-объявления, поэтому подойдёт любой свободный порт.
+        try:
+            server = await asyncio.start_server(handle, "0.0.0.0", 0)
+        except OSError as e:
+            msg = f"Не удалось занять ни порт {PORT}, ни другой свободный порт: {e}"
+            log(msg)
+            emit("error", msg)
+            return
+        log(f"Порт {PORT} занят другой программой, использую свободный порт "
+            f"{server.sockets[0].getsockname()[1]}")
+    port = server.sockets[0].getsockname()[1]
     props = {
         "txtvers": "1", "ch": "2", "cn": "0,1", "da": "true",
         "et": "0,1" if KEY else "0",
@@ -527,7 +535,7 @@ async def serve(name):
         "_raop._tcp.local.",
         f"{MAC_HEX}@{NAME}._raop._tcp.local.",
         addresses=[socket.inet_aton(ip)],
-        port=PORT,
+        port=port,
         properties=props,
         server=f"{socket.gethostname()}.local.",
     )
@@ -544,9 +552,9 @@ async def serve(name):
                         f" потеряно: {STATS['lost']}, ошибок декодера: {STATS['errors']}", debug=True)
 
         stats_task = asyncio.create_task(stats())
-        log(f"AirPlay-приёмник «{NAME}» запущен на {ip}:{PORT}"
+        log(f"AirPlay-приёмник «{NAME}» запущен на {ip}:{port}"
             f" ({'с ключом' if KEY else 'БЕЗ ключа airport_key.pem'})")
-        emit("started", {"name": NAME, "ip": ip, "key": KEY is not None})
+        emit("started", {"name": NAME, "ip": ip, "port": port, "key": KEY is not None})
         await server.serve_forever()
     except asyncio.CancelledError:
         raise
