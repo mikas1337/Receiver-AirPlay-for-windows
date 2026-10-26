@@ -369,6 +369,55 @@ def local_ip() -> str:
 
 
 # --------------------------------------------------------------------------- #
+#  Метаданные трека: DMAP (название, исполнитель...), обложка, позиция
+# --------------------------------------------------------------------------- #
+DMAP_CONTAINERS = {b"mlit", b"cmst", b"mdcl"}          # вложенные «коробки» DMAP
+DMAP_TEXT = {b"minm": "title", b"asar": "artist", b"asal": "album", b"asgn": "genre"}
+MAX_COVER_BYTES = 8 * 1024 * 1024
+
+
+def parse_dmap(body: bytes, depth: int = 0) -> dict:
+    """Разобрать DMAP: последовательность «тег (4 байта), длина (4 байта, big-endian), значение».
+
+    Берём название (minm), исполнителя (asar), альбом (asal), жанр (asgn) и длительность в мс (astm).
+    Повреждённые или обрезанные данные не вызывают ошибок: возвращается то, что удалось прочитать.
+    """
+    out = {}
+    n = len(body)
+    off = 0
+    while off + 8 <= n and depth < 4:
+        tag = body[off:off + 4]
+        ln = struct.unpack(">I", body[off + 4:off + 8])[0]
+        off += 8
+        if ln > n - off:
+            break  # длина выходит за пределы данных - обрезано
+        val = body[off:off + ln]
+        off += ln
+        if tag in DMAP_CONTAINERS:
+            out.update(parse_dmap(val, depth + 1))
+        elif tag in DMAP_TEXT:
+            text = val.decode("utf-8", "replace").strip("\x00").strip()
+            if text:
+                out[DMAP_TEXT[tag]] = text
+        elif tag == b"astm" and ln == 4:
+            out["duration"] = struct.unpack(">I", val)[0] / 1000.0
+    return out
+
+
+def parse_progress(text: bytes, rate: int = 44100):
+    """«progress: начало/текущая/конец» (RTP-метки) -> (позиция, длительность) в секундах или None."""
+    m = re.search(rb"progress:\s*(\d+)/(\d+)/(\d+)", text)
+    if not m or rate <= 0:
+        return None
+    start, cur, end = (int(x) for x in m.groups())
+    pos = ((cur - start) & 0xFFFFFFFF) / rate
+    dur = ((end - start) & 0xFFFFFFFF) / rate
+    if not (0 < dur < 12 * 3600) or pos > dur + 5:
+        return None  # похоже на мусор (например, перехлёст счётчика)
+    return pos, dur
+
+
+# --------------------------------------------------------------------------- #
 #  Плеер: буфер пакетов -> ALAC -> звуковая карта
 # --------------------------------------------------------------------------- #
 class Player:
@@ -398,6 +447,8 @@ class Player:
         self._opened_name = None   # какое устройство (по имени) было выбрано при открытии потока
         self._opened_mode = None   # какой режим задержки был при открытии потока
         self._reset_device = False  # попросили сбросить буфер звукового устройства (после FLUSH)
+        self._sounding = False      # звук реально идёт (для индикации и отсчёта времени в окне)
+        self._flush_gen = 0         # номер «поколения»: растёт при каждом FLUSH (см. _set_sounding)
         self.floor_ts = None       # пакеты старше этой RTP-метки (из FLUSH) выбрасываем
         self.floor_seq = None
         self._floor_drops = 0
@@ -449,7 +500,14 @@ class Player:
             self.floor_ts = until_ts
             self.floor_seq = until_seq
             self._floor_drops = 0
+            self._flush_gen += 1
         self._reset_device = True
+        self._set_sounding(False)
+
+    def _set_sounding(self, value: bool):
+        if self._sounding != value:
+            self._sounding = value
+            emit("play_state", value)
 
     def set_volume_db(self, db: float):
         # AirPlay: от -30 dB (тихо) до 0 dB (макс), -144 = mute
@@ -613,9 +671,14 @@ class Player:
         last_retry = 0.0
         starve_since = None
         writes_since_open = 0
+        last_write_t = time.time()
         try:
             while self.running:
                 now = time.time()
+
+                # сторож: звука не было больше секунды (пауза, потеря сети, нет устройства) - сообщаем об этом
+                if self._sounding and now - last_write_t > 1.0:
+                    self._set_sounding(False)
 
                 # нет потока (устройство пропало) - пробуем открыть заново раз в секунду
                 if stream is None and now - last_retry > 1.0:
@@ -658,7 +721,9 @@ class Player:
 
                 self._maybe_shrink_target(now)
                 pkt, lost = None, False
+                pkt_gen = self._flush_gen
                 with self.lock:
+                    pkt_gen = self._flush_gen
                     if self.next is None:
                         starve_since = None
                         if len(self.buf) >= self._target:
@@ -690,6 +755,7 @@ class Player:
                                 self.next = None  # поток остановился (пауза) - ждём, пока накопится заново
                                 starve_since = None
                                 writes_since_open = 0  # после паузы карта пуста: первые «опустошения» - не вина сети
+                                self._set_sounding(False)
                 if pkt is None and not lost:
                     time.sleep(0.004)
                     continue
@@ -717,8 +783,12 @@ class Player:
                 try:
                     underflow = stream.write(pcm_bytes)
                     writes_since_open += 1
+                    last_write_t = time.time()
                     if not lost:
                         STATS["played"] += 1
+                        # если за время записи пришёл FLUSH, этот пакет - из прошлого: «играет» не ставим
+                        if pkt_gen == self._flush_gen:
+                            self._set_sounding(True)
                     if underflow is True and writes_since_open > 20:
                         # звуковая карта осталась без данных - это и есть слышимый треск/пропадание
                         t3 = time.time()
@@ -897,14 +967,34 @@ class Session:
         return "200 OK", {}, b""
 
     async def do_set_parameter(self, hdr, body):
-        if hdr.get("content-type", "").startswith("text/parameters") and self.player:
+        ct = hdr.get("content-type", "")
+        rt = None
+        m_rt = re.search(r"rtptime=(\d+)", hdr.get("rtp-info", ""))
+        if m_rt:
+            rt = int(m_rt.group(1))   # метка, по которой источник связывает название и обложку одного трека
+        log(f"[диагностика] SET_PARAMETER {ct or '-'}, {len(body)} байт", debug=True)
+
+        if ct.startswith("text/parameters") and self.player:
             m = re.search(rb"volume:\s*(-?\d+(?:\.\d+)?)", body)
             if m:
                 db = float(m.group(1))
                 self.player.set_volume_db(db)
                 pct = 0 if db <= -100 else max(0, min(100, round((db + 30) / 30 * 100)))
                 emit("volume", pct)
-        # Метаданные (DAAP) и обложка приходят сюда же - пока игнорируем
+            prog = parse_progress(body, self.player.rate)
+            if prog:
+                emit("progress", {"pos": prog[0], "dur": prog[1]})
+        elif ct.startswith("application/x-dmap-tagged"):
+            info = parse_dmap(body)
+            if info:
+                info["rt"] = rt
+                log(f"[диагностика] трек: {info}", debug=True)
+                emit("track", info)
+        elif ct.startswith("image/"):
+            if 0 < len(body) <= MAX_COVER_BYTES:
+                emit("cover", {"data": bytes(body), "rt": rt})
+            elif not body:
+                emit("cover", {"data": b"", "rt": rt})   # пустая картинка = обложки нет
         return "200 OK", {}, b""
 
     async def do_get_parameter(self, hdr, body):
@@ -1032,15 +1122,30 @@ async def serve(name):
             log(f"Файл ключа не прочитан ({KEY_ERROR}); приёмник работает без шифрования")
 
         async def stats():
+            real_time_pps = 44100 / FRAMES_PER_PACKET     # ~125,3 пакета/с - так шлёт источник при обычной скорости
+            last_rtp, last_t, off_count, last_warn = STATS["rtp"], time.time(), 0, 0.0
             while True:
                 await asyncio.sleep(3)
+                now_t = time.time()
+                cur = STATS["rtp"]
+                pps = (cur - last_rtp) / max(0.001, now_t - last_t) if cur >= last_rtp else 0.0
+                last_rtp, last_t = cur, now_t
                 if ACTIVE:
                     pl = ACTIVE.player
                     extra = ""
                     if pl is not None:
                         extra = (f", буфер {pl._target * 8} мс, очередь {len(pl.buf)}, "
                                  f"треска (опустошений) {STATS['underruns']}, срезано {STATS['trimmed']}")
-                    log(f"[диагностика] принято пакетов: {STATS['rtp']}, воспроизведено: {STATS['played']},"
+                        # скорость поступления сильно отличается от реального времени -> звук будет «уплывать»
+                        if pl._sounding and (pps > real_time_pps * 1.12 or pps < real_time_pps * 0.88):
+                            off_count += 1
+                        else:
+                            off_count = 0
+                        if off_count >= 2 and now_t - last_warn > 15:
+                            last_warn = now_t
+                            log(f"Источник шлёт звук со скоростью {pps:.0f} пакетов/с вместо {real_time_pps:.0f}: "
+                                f"звук будет отставать или забегать вперёд относительно видео")
+                    log(f"[диагностика] принято пакетов: {STATS['rtp']} ({pps:.0f}/с), воспроизведено: {STATS['played']},"
                         f" потеряно: {STATS['lost']}, ошибок декодера: {STATS['errors']}{extra}", debug=True)
 
         async def ip_watch():
