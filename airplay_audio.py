@@ -349,7 +349,7 @@ def resolve_name(cli_name, rename: bool) -> str:
     return name
 
 
-STATS = {"rtp": 0, "played": 0, "errors": 0, "lost": 0, "underruns": 0, "trimmed": 0}
+STATS = {"rtp": 0, "played": 0, "errors": 0, "lost": 0, "underruns": 0, "trimmed": 0, "retx_req": 0, "retx_ok": 0}
 
 
 def b64d(s: str) -> bytes:
@@ -404,6 +404,33 @@ def parse_dmap(body: bytes, depth: int = 0) -> dict:
     return out
 
 
+def dmap_tags(body: bytes, depth: int = 0) -> list:
+    """Список тегов DMAP для отладки: «имя(длина)» или «имя='текст'» для коротких текстовых значений."""
+    out, off, n = [], 0, len(body)
+    while off + 8 <= n and depth < 4:
+        tag = body[off:off + 4]
+        ln = struct.unpack(">I", body[off + 4:off + 8])[0]
+        off += 8
+        if ln > n - off:
+            break
+        val = body[off:off + ln]
+        off += ln
+        name = tag.decode("ascii", "replace")
+        if tag in DMAP_CONTAINERS:
+            out.append(f"{name}[" + " ".join(dmap_tags(val, depth + 1)) + "]")
+            continue
+        shown = f"({ln})"
+        if 0 < ln <= 60:
+            try:
+                text = val.decode("utf-8")
+                if text.isprintable():
+                    shown = f"={text!r}"
+            except UnicodeDecodeError:
+                pass
+        out.append(name + shown)
+    return out
+
+
 def parse_progress(text: bytes, rate: int = 44100):
     """«progress: начало/текущая/конец» (RTP-метки) -> (позиция, длительность) в секундах или None."""
     m = re.search(rb"progress:\s*(\d+)/(\d+)/(\d+)", text)
@@ -428,6 +455,8 @@ class Player:
     SHRINK_EVERY = 15.0    # и как часто уменьшать (на 2 пакета)
     TRIM_AT = 12           # очередь больше запаса на столько пакетов (~96 мс): сбрасываем лишнее в тихих местах
     TRIM_FORCE = 30        # а если больше на столько (~240 мс): перескакиваем вперёд один раз, любой ценой
+    RETX_WAIT = 5          # пропавший пакет ждём, пока за ним не накопится столько пакетов (~40 мс), потом пропускаем
+    RETX_MAX = 40          # больше пакетов подряд не запрашиваем (скорее всего это не потеря, а перемотка)
 
     @property
     def prebuf(self) -> int:
@@ -449,6 +478,8 @@ class Player:
         self._reset_device = False  # попросили сбросить буфер звукового устройства (после FLUSH)
         self._sounding = False      # звук реально идёт (для индикации и отсчёта времени в окне)
         self._flush_gen = 0         # номер «поколения»: растёт при каждом FLUSH (см. _set_sounding)
+        self._hi = None             # самый большой номер пакета, который мы видели (чтобы заметить «дырку»)
+        self.on_gap = None          # функция(первый_номер_16бит, сколько): попросить источник повторить пакеты
         self.floor_ts = None       # пакеты старше этой RTP-метки (из FLUSH) выбрасываем
         self.floor_seq = None
         self._floor_drops = 0
@@ -489,8 +520,18 @@ class Player:
             else:
                 ext = self.last + ((seq - (self.last & 0xFFFF) + 32768) % 65536 - 32768)
             self.last = ext
+            gap = None
+            if self._hi is None:
+                self._hi = ext
+            elif ext > self._hi:
+                missing = ext - self._hi - 1
+                if 0 < missing <= self.RETX_MAX:
+                    gap = (self._hi + 1, missing)   # пакеты между прежним максимумом и этим - потерялись или опаздывают
+                self._hi = ext
             if self.next is None or ext >= self.next:
                 self.buf[ext] = data
+        if gap and self.on_gap:  # вне блокировки: запрос отправляется по сети
+            self.on_gap(gap[0] & 0xFFFF, gap[1])
 
     def flush(self, until_ts=None, until_seq=None):
         """Пауза/перемотка/смена ролика: выбросить накопленное и сбросить буфер звукового устройства."""
@@ -500,6 +541,7 @@ class Player:
             self.floor_ts = until_ts
             self.floor_seq = until_seq
             self._floor_drops = 0
+            self._hi = None
             self._flush_gen += 1
         self._reset_device = True
         self._set_sounding(False)
@@ -747,8 +789,11 @@ class Player:
                             if starve_since is None:
                                 starve_since = t2
                             waited = t2 - starve_since
-                            if self.buf and (len(self.buf) >= self._target or waited > 0.06):
-                                self.next += 1  # пакет потерян или сильно опоздал - пропускаем
+                            if self.buf and (len(self.buf) >= min(self.RETX_WAIT, self._target) or waited > 0.06):
+                                # Пакет потерян или сильно опоздал. Пропускаем сразу, как только за ним накопилось
+                                # ~40 мс звука (повторный запрос уже успел вернуться): иначе каждое ожидание
+                                # добавляло бы задержку, и звук отставал бы от видео всё больше.
+                                self.next += 1
                                 lost = True
                                 starve_since = None
                             elif not self.buf and waited > 1.0:
@@ -822,6 +867,7 @@ class RtpProto(asyncio.DatagramProtocol):
             log(f"[диагностика] первый UDP-пакет от {addr}, {len(data)} байт, тип 0x{data[1] & 0x7F:02x}", debug=True)
         ptype = data[1] & 0x7F
         if ptype == 0x56:  # повторно отправленный пакет (внутри обычный RTP с 4-го байта)
+            STATS["retx_ok"] += 1
             data = data[4:]
             if len(data) < 12:
                 return
@@ -854,6 +900,9 @@ class Session:
     def __init__(self, writer):
         self.writer = writer
         self.announced = False
+        self.client_ctrl = None      # (адрес, порт управления источника) - сюда просим повторить пакеты
+        self.ctrl_transport = None
+        self._ctrl_seq = 0
         self.client_name = ""
         try:
             self.peer = writer.get_extra_info("peername")[0]
@@ -888,6 +937,18 @@ class Session:
             self.writer.close()
         except Exception:
             pass
+
+    def request_retransmit(self, seq16: int, count: int):
+        """RAOP: просим источник повторно прислать пакеты seq16 ... seq16+count-1 (тип 0x55 на порт управления)."""
+        if self.ctrl_transport is None or self.client_ctrl is None:
+            return
+        self._ctrl_seq = (self._ctrl_seq + 1) & 0xFFFF
+        pkt = struct.pack(">BBHHH", 0x80, 0xD5, self._ctrl_seq, seq16 & 0xFFFF, count)
+        try:
+            self.ctrl_transport.sendto(pkt, self.client_ctrl)
+            STATS["retx_req"] += 1
+        except Exception:
+            pass  # транспорт уже закрыт - не страшно
 
     async def dispatch(self, method, hdr, body):
         fn = getattr(self, "do_" + method.lower(), None)
@@ -932,6 +993,8 @@ class Session:
         if not self.fmtp:
             return "400 Bad Request", {}, b""
         self.player = Player(self.fmtp)
+        if self.ctrl_transport is not None:  # повторный ANNOUNCE после SETUP
+            self.player.on_gap = self.request_retransmit
         self.client_name = hdr.get("x-apple-client-name") or self.peer
         if not self.announced:
             self.announced = True
@@ -945,6 +1008,12 @@ class Session:
         ctrl_t, _ = await loop.create_datagram_endpoint(lambda: RtpProto(self), local_addr=("0.0.0.0", 0))
         time_t, _ = await loop.create_datagram_endpoint(NullProto, local_addr=("0.0.0.0", 0))
         self.transports += [data_t, ctrl_t, time_t]
+        self.ctrl_transport = ctrl_t
+        m_cp = re.search(r"control_port=(\d+)", hdr.get("transport", ""))
+        if m_cp:
+            self.client_ctrl = (self.peer, int(m_cp.group(1)))
+        if self.player:
+            self.player.on_gap = self.request_retransmit
         ports = [t.get_extra_info("sockname")[1] for t in (data_t, ctrl_t, time_t)]
         transport = (
             f"RTP/AVP/UDP;unicast;mode=record;server_port={ports[0]};"
@@ -985,6 +1054,7 @@ class Session:
             if prog:
                 emit("progress", {"pos": prog[0], "dur": prog[1]})
         elif ct.startswith("application/x-dmap-tagged"):
+            log("[диагностика] DMAP: " + " ".join(dmap_tags(body)), debug=True)
             info = parse_dmap(body)
             if info:
                 info["rt"] = rt
@@ -1143,10 +1213,15 @@ async def serve(name):
                             off_count = 0
                         if off_count >= 2 and now_t - last_warn > 15:
                             last_warn = now_t
-                            log(f"Источник шлёт звук со скоростью {pps:.0f} пакетов/с вместо {real_time_pps:.0f}: "
-                                f"звук будет отставать или забегать вперёд относительно видео")
+                            if pps < real_time_pps:
+                                log(f"Wi-Fi теряет около {100 * (1 - pps / real_time_pps):.0f}% пакетов звука "
+                                    f"({pps:.0f} из {real_time_pps:.0f} в секунду): возможны щелчки и пропуски. "
+                                    f"Проверьте сигнал Wi-Fi или загрузку сети")
+                            else:
+                                log(f"Источник шлёт звук быстрее обычного ({pps:.0f} пакетов/с вместо {real_time_pps:.0f})")
                     log(f"[диагностика] принято пакетов: {STATS['rtp']} ({pps:.0f}/с), воспроизведено: {STATS['played']},"
-                        f" потеряно: {STATS['lost']}, ошибок декодера: {STATS['errors']}{extra}", debug=True)
+                        f" потеряно: {STATS['lost']}, повторов запрошено/получено: {STATS['retx_req']}/{STATS['retx_ok']},"
+                        f" ошибок декодера: {STATS['errors']}{extra}", debug=True)
 
         async def ip_watch():
             """Сеть могла смениться (Wi-Fi переподключился, ноутбук проснулся): обновляем адрес в mDNS."""
