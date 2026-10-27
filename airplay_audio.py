@@ -279,6 +279,28 @@ def find_device_index(name):
     return None
 
 
+def full_device_name(short):
+    """Полное имя устройства для журнала.
+
+    Старый звуковой интерфейс Windows (MME) обрезает имена до 31 символа, например
+    «FxSound (FxSound Audio Enhancer» без закрывающей скобки. Полное имя ищем среди устройств
+    других интерфейсов (WASAPI, DirectSound). Не нашли - оставляем как есть, ничего не додумываем.
+    Только для показа: сравнение и сохранение устройств по-прежнему идут по коротким именам.
+    """
+    if not short or len(short) < 31:
+        return short
+    best = short
+    with PA_LOCK:
+        try:
+            for d in sd.query_devices():
+                n = d["name"]
+                if d["max_output_channels"] > 0 and n.startswith(short) and len(n) > len(best):
+                    best = n
+        except Exception:
+            pass
+    return best
+
+
 def default_output_signature():
     """Имя текущего устройства вывода по умолчанию в Windows (через winmm) или None, если не узнать.
 
@@ -457,6 +479,7 @@ class Player:
     TRIM_FORCE = 30        # а если больше на столько (~240 мс): перескакиваем вперёд один раз, любой ценой
     RETX_WAIT = 5          # пропавший пакет ждём, пока за ним не накопится столько пакетов (~40 мс), потом пропускаем
     RETX_MAX = 40          # больше пакетов подряд не запрашиваем (скорее всего это не потеря, а перемотка)
+    STARTUP_GRACE = 3.0    # секунд после старта/FLUSH/паузы: источник ещё «разгоняется», пустой буфер - не вина Wi-Fi
 
     @property
     def prebuf(self) -> int:
@@ -484,6 +507,7 @@ class Player:
         self.floor_seq = None
         self._floor_drops = 0
         self._target = self.prebuf     # текущий (адаптивный) размер буфера в пакетах
+        self._startup_until = time.time() + self.STARTUP_GRACE   # до этого момента нехватку пакетов не считаем сетевой
         self._last_trouble = time.time()
         self._last_grow_log = 0.0
         self._last_underflow = 0.0
@@ -543,6 +567,7 @@ class Player:
             self._floor_drops = 0
             self._hi = None
             self._flush_gen += 1
+            self._startup_until = time.time() + self.STARTUP_GRACE
         self._reset_device = True
         self._set_sounding(False)
 
@@ -638,6 +663,7 @@ class Player:
                     label = sd.query_devices(dev)["name"]
                 except Exception:
                     label = "?"
+            label = full_device_name(label)
             self.device_label = label
             log(f"Звук выводится на: {label}")
             log(f"[диагностика] поток открыт за {time.time() - t0:.2f} с", debug=True)
@@ -798,6 +824,7 @@ class Player:
                                 starve_since = None
                             elif not self.buf and waited > 1.0:
                                 self.next = None  # поток остановился (пауза) - ждём, пока накопится заново
+                                self._startup_until = time.time() + self.STARTUP_GRACE
                                 starve_since = None
                                 writes_since_open = 0  # после паузы карта пуста: первые «опустошения» - не вина сети
                                 self._set_sounding(False)
@@ -838,7 +865,14 @@ class Player:
                         # звуковая карта осталась без данных - это и есть слышимый треск/пропадание
                         t3 = time.time()
                         if t3 - self._last_underflow > 0.5:
-                            self._grow_target()
+                            if t3 < self._startup_until:
+                                # источник только начал слать звук ровным потоком: это не вина Wi-Fi,
+                                # поэтому буфер не раздуваем и «Wi-Fi неровный» не пишем (но пропадание считаем)
+                                STATS["underruns"] = STATS.get("underruns", 0) + 1
+                                log("[диагностика] буфер опустел сразу после старта (источник ещё разгоняется), "
+                                    "размер буфера не меняю", debug=True)
+                            else:
+                                self._grow_target()
                         self._last_underflow = t3
                         if len(self.buf) < self._target // 2:
                             with self.lock:
