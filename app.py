@@ -233,6 +233,8 @@ class App(ctk.CTk):
         cfg = core.load_config()
         self.name_value = cfg.get("name") or core.DEFAULT_NAME
         self.device_name = cfg.get("device") or DEFAULT_DEVICE_LABEL
+        if cfg.get("debug"):
+            core.VERBOSE = True      # «Подробный журнал» включён в окне раньше (или запуск с --debug)
         self.latency_key = cfg.get("latency") if cfg.get("latency") in LATENCY_LABELS else "normal"
         core.LATENCY_MODE = self.latency_key
         self.minimize_to_tray = bool(cfg.get("tray", True)) and HAVE_TRAY
@@ -345,18 +347,77 @@ class App(ctk.CTk):
         if not HAVE_TRAY:
             cb2.configure(state="disabled")
 
+        self.debug_var = ctk.BooleanVar(value=bool(core.VERBOSE))
+        ctk.CTkCheckBox(self.body, text="Подробный журнал (для диагностики)", variable=self.debug_var,
+                        command=self.on_debug).pack(anchor="w", pady=(0, 4), **pad)
+
         # журнал
-        ctk.CTkLabel(self.body, text="Журнал", anchor="w").pack(fill="x", pady=(10, 2), **pad)
+        log_head = ctk.CTkFrame(self.body, fg_color="transparent")
+        log_head.pack(fill="x", pady=(10, 2), **pad)
+        ctk.CTkLabel(log_head, text="Журнал").pack(side="left")
+        ctk.CTkButton(log_head, text="Папка", width=70, height=26, command=self.open_logs_folder).pack(
+            side="right", padx=(6, 0))
+        ctk.CTkButton(log_head, text="Копировать", width=100, height=26, command=self.copy_log).pack(side="right")
         self.log_box = ctk.CTkTextbox(self.body, height=150, state="disabled", font=ctk.CTkFont(size=12))
         self.log_box.pack(fill="x", pady=(0, 16), **pad)
 
     # ---- вспомогательное ---------------------------------------------------
+    def logs_dir(self) -> str:
+        return os.path.dirname(core.config_path())
+
+    def _write_log_file(self, line: str):
+        """Дублируем журнал в файл app.log (до ~1 МБ, затем старая часть переименовывается в app.log.1)."""
+        try:
+            os.makedirs(self.logs_dir(), exist_ok=True)
+            path = os.path.join(self.logs_dir(), "app.log")
+            if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+                os.replace(path, path + ".1")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
     def add_log(self, text: str):
-        stamp = time.strftime("%H:%M:%S")
+        line = f"{time.strftime('%H:%M:%S')}  {text}"
+        self._write_log_file(line)
         self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"{stamp}  {text}\n")
+        self.log_box.insert("end", line + "\n")
+        try:  # в подробном режиме строк очень много: держим в окне только последние ~600
+            if int(self.log_box.index("end-1c").split(".")[0]) > 700:
+                self.log_box.delete("1.0", "101.0")
+        except Exception:
+            pass
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+
+    def on_debug(self):
+        core.VERBOSE = bool(self.debug_var.get())
+        core.save_config(debug=core.VERBOSE)
+        self.add_log("Подробный журнал " + ("включён" if core.VERBOSE else "выключен"))
+
+    def copy_log(self):
+        """Скопировать весь журнал из окна в буфер обмена (потом вставить сообщением)."""
+        try:
+            self.log_box.configure(state="normal")
+            text = self.log_box.get("1.0", "end").strip()
+            self.log_box.configure(state="disabled")
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()  # чтобы Windows сохранила буфер обмена
+            self.add_log(f"Журнал скопирован в буфер обмена ({len(text.splitlines())} строк). Вставьте его: Ctrl+V")
+        except Exception:
+            self.report_error("копирование журнала")
+
+    def open_logs_folder(self):
+        """Открыть папку с app.log, crash.log и config.json."""
+        try:
+            os.makedirs(self.logs_dir(), exist_ok=True)
+            if hasattr(os, "startfile"):
+                os.startfile(self.logs_dir())  # только Windows
+            else:
+                self.add_log(f"Папка с журналами: {self.logs_dir()}")
+        except Exception:
+            self.report_error("открытие папки с журналами")
 
     def set_status(self, state: str, text: str, hint: str = ""):
         self.state_name = state
