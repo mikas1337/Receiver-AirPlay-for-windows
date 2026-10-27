@@ -12,6 +12,7 @@ Windows AirPlay - приложение с окном.
 """
 import argparse
 import asyncio
+import io
 import os
 import queue
 import socket
@@ -23,6 +24,14 @@ import traceback
 import customtkinter as ctk
 
 import airplay_audio as core
+
+HAVE_PIL = False
+try:  # Pillow нужен для обложек и значка; без него карточка трека работает только текстом
+    from PIL import Image, ImageOps
+
+    HAVE_PIL = True
+except Exception:  # pragma: no cover
+    pass
 
 TRAY_ERROR = ""
 try:  # значок в трее - необязательная часть
@@ -48,6 +57,28 @@ LATENCY_LABELS = {
 LOCK_PORT = 47625  # локальный порт-«замок»: не даёт запустить вторую копию приложения
 
 GREEN, BLUE, RED, GRAY = "#2ecc71", "#3b8ed0", "#e74c3c", "#7f8c8d"
+
+
+COVER_PX = 176   # обложка хранится в двойном размере (для чёткости на экранах с масштабом 150-200%)
+
+
+def make_cover_image(data: bytes):
+    """Байты картинки (JPEG/PNG) -> квадратная обложка COVER_PX x COVER_PX или None, если прочитать не удалось."""
+    if not HAVE_PIL or not data:
+        return None
+    try:
+        img = Image.open(io.BytesIO(data))
+        img = img.convert("RGB")
+        return ImageOps.fit(img, (COVER_PX, COVER_PX))   # обрезка по центру до квадрата
+    except Exception:
+        return None
+
+
+def fmt_time(seconds: float) -> str:
+    """83 -> «1:23», 3725 -> «1:02:05»."""
+    m, s = divmod(max(0, int(seconds)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def crash_log_path() -> str:
@@ -229,6 +260,13 @@ class App(ctk.CTk):
         self.pending_start = False    # запустить заново, когда остановится (смена имени)
         self.quitting = False
         self.lock_sock = None
+        self.track = {}              # название, исполнитель, альбом текущего трека
+        self.track_rt = None         # метки источника, по которым связываются название и обложка
+        self.cover_rt = None
+        self.cover_ctk = None        # картинка обложки (ссылку держим, иначе её удалит сборщик мусора)
+        self.prog = {"base": 0.0, "t0": 0.0, "dur": 0.0, "running": False}
+        self._shown_sec = -1
+        self.last_started = None
 
         cfg = core.load_config()
         self.name_value = cfg.get("name") or core.DEFAULT_NAME
@@ -284,6 +322,30 @@ class App(ctk.CTk):
         self.status.pack(side="left", padx=8)
         self.hint = ctk.CTkLabel(box, text="", text_color=GRAY, wraplength=370, justify="left")
         self.hint.pack(fill="x", padx=14, pady=(0, 12), anchor="w")
+
+        # карточка «сейчас играет»: обложка, название, исполнитель, альбом, время
+        np_box = ctk.CTkFrame(self.body, corner_radius=12)
+        np_box.pack(fill="x", pady=(0, 10), **pad)
+        np_top = ctk.CTkFrame(np_box, fg_color="transparent")
+        np_top.pack(fill="x", padx=12, pady=(12, 4))
+        self.cover_label = ctk.CTkLabel(np_top, text="", width=88, height=88)
+        self.cover_label.pack(side="left")
+        np_txt = ctk.CTkFrame(np_top, fg_color="transparent")
+        np_txt.pack(side="left", fill="both", expand=True, padx=(12, 0))
+        self.np_title = ctk.CTkLabel(np_txt, text="", anchor="w", justify="left", wraplength=240,
+                                     font=ctk.CTkFont(size=15, weight="bold"))
+        self.np_title.pack(fill="x", anchor="w")
+        self.np_artist = ctk.CTkLabel(np_txt, text="", anchor="w", justify="left", wraplength=240)
+        self.np_artist.pack(fill="x", anchor="w")
+        self.np_album = ctk.CTkLabel(np_txt, text="", anchor="w", justify="left", wraplength=240, text_color=GRAY)
+        self.np_album.pack(fill="x", anchor="w")
+        self.np_bar = ctk.CTkProgressBar(np_box)
+        self.np_bar.set(0)
+        self.np_bar.pack(fill="x", padx=12, pady=(6, 0))
+        self.np_time = ctk.CTkLabel(np_box, text="", text_color=GRAY, anchor="e")
+        self.np_time.pack(fill="x", padx=12, pady=(0, 10))
+        self._set_placeholder_cover()
+        self.refresh_now_playing()
 
         self.toggle_btn = ctk.CTkButton(self.body, text="Запустить", height=38, command=self.toggle_server)
         self.toggle_btn.pack(fill="x", **pad)
@@ -360,6 +422,95 @@ class App(ctk.CTk):
         ctk.CTkButton(log_head, text="Копировать", width=100, height=26, command=self.copy_log).pack(side="right")
         self.log_box = ctk.CTkTextbox(self.body, height=150, state="disabled", font=ctk.CTkFont(size=12))
         self.log_box.pack(fill="x", pady=(0, 16), **pad)
+
+    # ---- карточка «сейчас играет» --------------------------------------------
+    def _set_cover(self, img):
+        """Показать картинку (PIL) в карточке. img=None - значок приложения."""
+        if not HAVE_PIL:
+            return
+        try:
+            self.cover_ctk = ctk.CTkImage(light_image=img, dark_image=img, size=(88, 88))
+            self.cover_label.configure(image=self.cover_ctk)
+        except Exception:
+            self.report_error("показ обложки")
+
+    def _set_placeholder_cover(self):
+        if HAVE_TRAY:
+            try:
+                self._set_cover(make_icon(COVER_PX))
+            except Exception:
+                pass
+
+    def clear_cover(self):
+        self.cover_rt = None
+        self._set_placeholder_cover()
+
+    def refresh_now_playing(self):
+        t = self.track
+        if t.get("title"):
+            title, artist, album = t["title"], t.get("artist", ""), t.get("album", "")
+        elif self.state_name == "playing":
+            title = "Название трека не передаётся"
+            artist = "Видео и многие приложения его не присылают"
+            album = ""
+        else:
+            title, artist, album = "Ничего не играет", "", ""
+        self.np_title.configure(text=title)
+        self.np_artist.configure(text=artist)
+        self.np_album.configure(text=album)
+
+    def position_now(self) -> float:
+        p = self.prog
+        pos = p["base"] + ((time.time() - p["t0"]) if p["running"] else 0.0)
+        return max(0.0, min(pos, p["dur"]) if p["dur"] > 0 else pos)
+
+    def update_progress(self):
+        """Обновляет полоску и время (вызывается каждые 150 мс, но перерисовывает раз в секунду)."""
+        dur = self.prog["dur"]
+        if dur <= 0:
+            if self._shown_sec != -2:
+                self._shown_sec = -2
+                self.np_bar.set(0)
+                self.np_time.configure(text="")
+            return
+        pos = self.position_now()
+        if int(pos) != self._shown_sec:
+            self._shown_sec = int(pos)
+            self.np_bar.set(pos / dur)
+            self.np_time.configure(text=f"{fmt_time(pos)} / {fmt_time(dur)}")
+
+    def _set_sounding(self, running: bool):
+        """Звук пошёл / остановился: время трека идёт только пока звук реально играет."""
+        p = self.prog
+        if running and not p["running"]:
+            p["t0"] = time.time()
+            p["running"] = True
+        elif not running and p["running"]:
+            p["base"] = self.position_now()
+            p["running"] = False
+
+    def reset_now_playing(self):
+        self.track = {}
+        self.track_rt = None
+        self.prog = {"base": 0.0, "t0": 0.0, "dur": 0.0, "running": False}
+        self._shown_sec = -1
+        self.clear_cover()
+        self.refresh_now_playing()
+        self.update_progress()
+        self.update_tray_title()
+
+    def _tray_title(self) -> str:
+        t = self.track
+        if t.get("title"):
+            return (t["artist"] + " — " if t.get("artist") else "") + t["title"]
+        return APP_TITLE
+
+    def update_tray_title(self):
+        if self.tray is not None:
+            try:
+                self.tray.title = self._tray_title()
+            except Exception:
+                pass
 
     # ---- вспомогательное ---------------------------------------------------
     def logs_dir(self) -> str:
@@ -552,6 +703,10 @@ class App(ctk.CTk):
                     self.handle_event(kind, data)
                 except Exception:
                     self.report_error(f"обработка события «{kind}»")
+            try:
+                self.update_progress()
+            except Exception:
+                self.report_error("обновление времени трека")
         finally:
             if not self.quitting:
                 try:
@@ -576,12 +731,44 @@ class App(ctk.CTk):
             if self.state_name == "running":
                 self.set_status("running", "Работает", self._running_hint(self.last_started))
         elif kind == "connected":
+            self.reset_now_playing()          # новая сессия - данные прошлого трека не нужны
             self.set_status("playing", f"Играет: {data}", "Звук идёт на выбранное устройство")
+            self.refresh_now_playing()
         elif kind == "disconnected":
             if self.state_name == "playing":
                 self.set_status("running", "Работает", f"Ожидаю подключения к «{self.name_value}»")
             self.vol_bar.set(0)
             self.vol_label.configure(text="—")
+            self.reset_now_playing()
+        elif kind == "track":
+            changed = (data.get("title"), data.get("artist")) != (self.track.get("title"), self.track.get("artist"))
+            # новый трек: старая обложка не подходит, если только источник не пометил её тем же rtptime
+            if changed and (data.get("rt") is None or data.get("rt") != self.cover_rt):
+                self.clear_cover()
+            self.track = {k: v for k, v in data.items() if k != "rt"}
+            self.track_rt = data.get("rt")
+            if data.get("duration") and not self.prog["dur"]:
+                self.prog["dur"] = float(data["duration"])   # длительность из метаданных, если прогресса нет
+            self.refresh_now_playing()
+            self.update_progress()
+            self.update_tray_title()
+        elif kind == "cover":
+            if data.get("data"):
+                img = make_cover_image(data["data"])
+                if img is not None:
+                    self._set_cover(img)
+                    self.cover_rt = data.get("rt")
+                else:
+                    self.add_log("Не удалось прочитать обложку (неизвестный формат картинки)")
+            else:
+                self.clear_cover()            # пустая картинка = у трека обложки нет
+        elif kind == "progress":
+            self.prog.update(base=float(data["pos"]), t0=time.time(), dur=float(data["dur"]))
+            self._shown_sec = -1
+            self.update_progress()
+        elif kind == "play_state":
+            self._set_sounding(bool(data))
+            self.update_progress()
         elif kind == "volume":
             self.vol_bar.set(data / 100)
             self.vol_label.configure(text=f"{data}%")
@@ -621,7 +808,7 @@ class App(ctk.CTk):
             return
         if self.tray is None:
             try:
-                self.tray = pystray.Icon("WindowsAirPlay", make_icon(64), APP_TITLE, self._tray_menu())
+                self.tray = pystray.Icon("WindowsAirPlay", make_icon(64), self._tray_title(), self._tray_menu())
                 self.tray.run_detached()
             except Exception:
                 self.tray = None
