@@ -70,6 +70,8 @@ MENU = {"fg_color": ACCENT, "button_color": ACCENT, "button_hover_color": ACCENT
         "dropdown_fg_color": FIELD, "dropdown_hover_color": ACCENT}
 BAR = {"fg_color": FIELD, "progress_color": ACCENT_LIGHT}
 
+COMPACT_H, FULL_H = 440, 720   # высота окна: без панели «Параметры» / с открытой панелью
+
 
 COVER_PX = 176   # обложка хранится в двойном размере (для чёткости на экранах с масштабом 150-200%)
 
@@ -264,8 +266,8 @@ class App(ctk.CTk):
         self.configure(fg_color=BG)
 
         self.title(APP_TITLE)
-        self.geometry("460x720")
-        self.minsize(420, 520)
+        self.geometry(f"460x{COMPACT_H}")
+        self.minsize(420, 360)
         self.q: "queue.Queue" = queue.Queue()
         self.server = ServerThread(self.q)
         self.tray = None
@@ -318,15 +320,9 @@ class App(ctk.CTk):
         self.body = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.body.pack(fill="both", expand=True)
 
-        head = ctk.CTkFrame(self.body, fg_color="transparent")
-        head.pack(fill="x", pady=(18, 4), **pad)
-        ctk.CTkLabel(head, text="🎵  " + APP_TITLE, font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w")
-        ctk.CTkLabel(head, text="Звук с iPhone, iPad и Mac на этот компьютер",
-                     text_color=GRAY).pack(anchor="w")
-
         # статус
         box = ctk.CTkFrame(self.body, corner_radius=12, fg_color=CARD)
-        box.pack(fill="x", pady=10, **pad)
+        box.pack(fill="x", pady=(16, 10), **pad)
         row = ctk.CTkFrame(box, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=(12, 2))
         self.dot = ctk.CTkLabel(row, text="●", text_color=GRAY, font=ctk.CTkFont(size=22))
@@ -360,13 +356,23 @@ class App(ctk.CTk):
         self._set_placeholder_cover()
         self.refresh_now_playing()
 
-        self.toggle_btn = ctk.CTkButton(self.body, text="Запустить", height=38, command=self.toggle_server, **BTN)
-        self.toggle_btn.pack(fill="x", **pad)
+        btn_row = ctk.CTkFrame(self.body, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(0, 14), **pad)
+        self.toggle_btn = ctk.CTkButton(btn_row, text="Запустить", height=38, command=self.toggle_server, **BTN)
+        self.toggle_btn.pack(side="left", fill="x", expand=True)
+        # шестерёнка: показывает и прячет панель «Параметры» (всё, что ниже, живёт внутри неё)
+        self.gear_btn = ctk.CTkButton(btn_row, text="⚙", width=38, height=38, font=ctk.CTkFont(size=20),
+                                      command=self.toggle_settings, **BTN)
+        self.gear_btn.pack(side="left", padx=(8, 0))
+
+        # панель «Параметры»: создаётся сразу, но скрыта, пока не нажата шестерёнка
+        self.settings_open = False
+        self.settings = ctk.CTkFrame(self.body, fg_color="transparent")
 
         # имя
-        ctk.CTkLabel(self.body, text="Название устройства (так оно видно в AirPlay)",
-                     anchor="w").pack(fill="x", pady=(16, 2), **pad)
-        name_row = ctk.CTkFrame(self.body, fg_color="transparent")
+        ctk.CTkLabel(self.settings, text="Название устройства (так оно видно в AirPlay)",
+                     anchor="w").pack(fill="x", pady=(4, 2), **pad)
+        name_row = ctk.CTkFrame(self.settings, fg_color="transparent")
         name_row.pack(fill="x", **pad)
         self.name_entry = ctk.CTkEntry(name_row, height=34, fg_color=FIELD)
         self.name_entry.insert(0, self.name_value)
@@ -376,12 +382,12 @@ class App(ctk.CTk):
             side="left", padx=(8, 0))
 
         # устройство вывода
-        ctk.CTkLabel(self.body, text="Куда выводить звук", anchor="w").pack(fill="x", pady=(14, 2), **pad)
+        ctk.CTkLabel(self.settings, text="Куда выводить звук", anchor="w").pack(fill="x", pady=(14, 2), **pad)
         self.devices = core.list_output_devices()
         labels = [DEFAULT_DEVICE_LABEL] + [n for _, n in self.devices]
         if self.device_name not in labels:
             self.device_name = DEFAULT_DEVICE_LABEL
-        dev_row = ctk.CTkFrame(self.body, fg_color="transparent")
+        dev_row = ctk.CTkFrame(self.settings, fg_color="transparent")
         dev_row.pack(fill="x", **pad)
         self.device_menu = ctk.CTkOptionMenu(dev_row, values=labels, command=self.on_device, height=34,
                                              dynamic_resizing=False, **MENU)
@@ -391,51 +397,65 @@ class App(ctk.CTk):
             side="left", padx=(8, 0))
 
         # задержка
-        ctk.CTkLabel(self.body, text="Задержка звука (меньше — быстрее пауза и смена роликов)",
+        ctk.CTkLabel(self.settings, text="Задержка звука (меньше — быстрее пауза и смена роликов)",
                      anchor="w").pack(fill="x", pady=(14, 2), **pad)
-        self.latency_menu = ctk.CTkOptionMenu(self.body, values=list(LATENCY_LABELS.values()),
+        self.latency_menu = ctk.CTkOptionMenu(self.settings, values=list(LATENCY_LABELS.values()),
                                               command=self.on_latency, height=34, dynamic_resizing=False, **MENU)
         self.latency_menu.set(LATENCY_LABELS[self.latency_key])
         self.latency_menu.pack(fill="x", **pad)
 
         # громкость
-        vol_row = ctk.CTkFrame(self.body, fg_color="transparent")
+        vol_row = ctk.CTkFrame(self.settings, fg_color="transparent")
         vol_row.pack(fill="x", pady=(16, 0), **pad)
         ctk.CTkLabel(vol_row, text="Громкость на телефоне").pack(side="left")
         self.vol_label = ctk.CTkLabel(vol_row, text="—", text_color=GRAY)
         self.vol_label.pack(side="right")
-        self.vol_bar = ctk.CTkProgressBar(self.body, **BAR)
+        self.vol_bar = ctk.CTkProgressBar(self.settings, **BAR)
         self.vol_bar.set(0)
         self.vol_bar.pack(fill="x", pady=(4, 0), **pad)
 
         # настройки
         self.autostart_var = ctk.BooleanVar(value=autostart_enabled())
-        cb = ctk.CTkCheckBox(self.body, text="Запускать вместе с Windows", variable=self.autostart_var,
+        cb = ctk.CTkCheckBox(self.settings, text="Запускать вместе с Windows", variable=self.autostart_var,
                              command=self.on_autostart, **BTN)
         cb.pack(anchor="w", pady=(16, 4), **pad)
         if not autostart_supported():
             cb.configure(state="disabled")
         self.tray_var = ctk.BooleanVar(value=self.minimize_to_tray)
-        cb2 = ctk.CTkCheckBox(self.body, text="При закрытии окна сворачивать в трей", variable=self.tray_var,
+        cb2 = ctk.CTkCheckBox(self.settings, text="При закрытии окна сворачивать в трей", variable=self.tray_var,
                               command=self.on_tray_option, **BTN)
         cb2.pack(anchor="w", pady=(0, 4), **pad)
         if not HAVE_TRAY:
             cb2.configure(state="disabled")
 
         self.debug_var = ctk.BooleanVar(value=bool(core.VERBOSE))
-        ctk.CTkCheckBox(self.body, text="Подробный журнал (для диагностики)", variable=self.debug_var,
+        ctk.CTkCheckBox(self.settings, text="Подробный журнал (для диагностики)", variable=self.debug_var,
                         command=self.on_debug, **BTN).pack(anchor="w", pady=(0, 4), **pad)
 
         # журнал
-        log_head = ctk.CTkFrame(self.body, fg_color="transparent")
+        log_head = ctk.CTkFrame(self.settings, fg_color="transparent")
         log_head.pack(fill="x", pady=(10, 2), **pad)
         ctk.CTkLabel(log_head, text="Журнал").pack(side="left")
         ctk.CTkButton(log_head, text="Папка", width=70, height=26, command=self.open_logs_folder, **BTN).pack(
             side="right", padx=(6, 0))
         ctk.CTkButton(log_head, text="Копировать", width=100, height=26, command=self.copy_log, **BTN).pack(side="right")
-        self.log_box = ctk.CTkTextbox(self.body, height=150, state="disabled", font=ctk.CTkFont(size=12),
+        self.log_box = ctk.CTkTextbox(self.settings, height=150, state="disabled", font=ctk.CTkFont(size=12),
                                       fg_color=FIELD)
         self.log_box.pack(fill="x", pady=(0, 16), **pad)
+
+    def toggle_settings(self):
+        """Шестерёнка: показать/спрятать панель «Параметры» и подогнать высоту окна."""
+        self.settings_open = not self.settings_open
+        if self.settings_open:
+            self.settings.pack(fill="x")
+        else:
+            self.settings.pack_forget()
+        try:
+            if self.state() == "normal":   # развёрнутое на весь экран окно не трогаем
+                w = int(getattr(self, "_current_width", 0) or 460)   # логическая ширина (без учёта масштаба Windows)
+                self.geometry(f"{w}x{FULL_H if self.settings_open else COMPACT_H}")
+        except Exception:
+            pass
 
     # ---- карточка «сейчас играет» --------------------------------------------
     def _set_cover(self, img):
