@@ -58,6 +58,18 @@ LOCK_PORT = 47625  # локальный порт-«замок»: не даёт �
 
 GREEN, BLUE, RED, GRAY = "#2ecc71", "#3b8ed0", "#e74c3c", "#7f8c8d"
 
+# --- оформление: меняйте цвета здесь ---
+BG = "#000000"            # фон окна
+ACCENT = "#0010e9"        # кнопки (и выпадающие списки, галочки)
+ACCENT_HOVER = "#2a3bff"  # кнопка под курсором
+ACCENT_LIGHT = "#4d5cff"  # заполнение полос (на чёрном тёмно-синий почти не виден)
+CARD = "#111111"          # карточки «статус» и «сейчас играет» (чуть светлее фона, чтобы блоки читались)
+FIELD = "#1a1a1a"         # поля ввода, журнал, пустая часть полос
+BTN = {"fg_color": ACCENT, "hover_color": ACCENT_HOVER}
+MENU = {"fg_color": ACCENT, "button_color": ACCENT, "button_hover_color": ACCENT_HOVER,
+        "dropdown_fg_color": FIELD, "dropdown_hover_color": ACCENT}
+BAR = {"fg_color": FIELD, "progress_color": ACCENT_LIGHT}
+
 
 COVER_PX = 176   # обложка хранится в двойном размере (для чёткости на экранах с масштабом 150-200%)
 
@@ -249,6 +261,7 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
         super().__init__()
+        self.configure(fg_color=BG)
 
         self.title(APP_TITLE)
         self.geometry("460x720")
@@ -312,7 +325,7 @@ class App(ctk.CTk):
                      text_color=GRAY).pack(anchor="w")
 
         # статус
-        box = ctk.CTkFrame(self.body, corner_radius=12)
+        box = ctk.CTkFrame(self.body, corner_radius=12, fg_color=CARD)
         box.pack(fill="x", pady=10, **pad)
         row = ctk.CTkFrame(box, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=(12, 2))
@@ -324,7 +337,7 @@ class App(ctk.CTk):
         self.hint.pack(fill="x", padx=14, pady=(0, 12), anchor="w")
 
         # карточка «сейчас играет»: обложка, название, исполнитель, альбом, время
-        np_box = ctk.CTkFrame(self.body, corner_radius=12)
+        np_box = ctk.CTkFrame(self.body, corner_radius=12, fg_color=CARD)
         np_box.pack(fill="x", pady=(0, 10), **pad)
         np_top = ctk.CTkFrame(np_box, fg_color="transparent")
         np_top.pack(fill="x", padx=12, pady=(12, 4))
@@ -339,7 +352,7 @@ class App(ctk.CTk):
         self.np_artist.pack(fill="x", anchor="w")
         self.np_album = ctk.CTkLabel(np_txt, text="", anchor="w", justify="left", wraplength=240, text_color=GRAY)
         self.np_album.pack(fill="x", anchor="w")
-        self.np_bar = ctk.CTkProgressBar(np_box)
+        self.np_bar = ctk.CTkProgressBar(np_box, **BAR)
         self.np_bar.set(0)
         self.np_bar.pack(fill="x", padx=12, pady=(6, 0))
         self.np_time = ctk.CTkLabel(np_box, text="", text_color=GRAY, anchor="e")
@@ -347,7 +360,7 @@ class App(ctk.CTk):
         self._set_placeholder_cover()
         self.refresh_now_playing()
 
-        self.toggle_btn = ctk.CTkButton(self.body, text="Запустить", height=38, command=self.toggle_server)
+        self.toggle_btn = ctk.CTkButton(self.body, text="Запустить", height=38, command=self.toggle_server, **BTN)
         self.toggle_btn.pack(fill="x", **pad)
 
         # имя
@@ -355,11 +368,11 @@ class App(ctk.CTk):
                      anchor="w").pack(fill="x", pady=(16, 2), **pad)
         name_row = ctk.CTkFrame(self.body, fg_color="transparent")
         name_row.pack(fill="x", **pad)
-        self.name_entry = ctk.CTkEntry(name_row, height=34)
+        self.name_entry = ctk.CTkEntry(name_row, height=34, fg_color=FIELD)
         self.name_entry.insert(0, self.name_value)
         self.name_entry.pack(side="left", fill="x", expand=True)
         self.name_entry.bind("<Return>", lambda e: self.save_name())
-        ctk.CTkButton(name_row, text="Сохранить", width=100, height=34, command=self.save_name).pack(
+        ctk.CTkButton(name_row, text="Сохранить", width=100, height=34, command=self.save_name, **BTN).pack(
             side="left", padx=(8, 0))
 
         # устройство вывода
@@ -371,17 +384,17 @@ class App(ctk.CTk):
         dev_row = ctk.CTkFrame(self.body, fg_color="transparent")
         dev_row.pack(fill="x", **pad)
         self.device_menu = ctk.CTkOptionMenu(dev_row, values=labels, command=self.on_device, height=34,
-                                             dynamic_resizing=False)
+                                             dynamic_resizing=False, **MENU)
         self.device_menu.set(self.device_name)
         self.device_menu.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(dev_row, text="⟳", width=40, height=34, command=self.refresh_devices).pack(
+        ctk.CTkButton(dev_row, text="⟳", width=40, height=34, command=self.refresh_devices, **BTN).pack(
             side="left", padx=(8, 0))
 
         # задержка
         ctk.CTkLabel(self.body, text="Задержка звука (меньше — быстрее пауза и смена роликов)",
                      anchor="w").pack(fill="x", pady=(14, 2), **pad)
         self.latency_menu = ctk.CTkOptionMenu(self.body, values=list(LATENCY_LABELS.values()),
-                                              command=self.on_latency, height=34, dynamic_resizing=False)
+                                              command=self.on_latency, height=34, dynamic_resizing=False, **MENU)
         self.latency_menu.set(LATENCY_LABELS[self.latency_key])
         self.latency_menu.pack(fill="x", **pad)
 
@@ -391,36 +404,37 @@ class App(ctk.CTk):
         ctk.CTkLabel(vol_row, text="Громкость на телефоне").pack(side="left")
         self.vol_label = ctk.CTkLabel(vol_row, text="—", text_color=GRAY)
         self.vol_label.pack(side="right")
-        self.vol_bar = ctk.CTkProgressBar(self.body)
+        self.vol_bar = ctk.CTkProgressBar(self.body, **BAR)
         self.vol_bar.set(0)
         self.vol_bar.pack(fill="x", pady=(4, 0), **pad)
 
         # настройки
         self.autostart_var = ctk.BooleanVar(value=autostart_enabled())
         cb = ctk.CTkCheckBox(self.body, text="Запускать вместе с Windows", variable=self.autostart_var,
-                             command=self.on_autostart)
+                             command=self.on_autostart, **BTN)
         cb.pack(anchor="w", pady=(16, 4), **pad)
         if not autostart_supported():
             cb.configure(state="disabled")
         self.tray_var = ctk.BooleanVar(value=self.minimize_to_tray)
         cb2 = ctk.CTkCheckBox(self.body, text="При закрытии окна сворачивать в трей", variable=self.tray_var,
-                              command=self.on_tray_option)
+                              command=self.on_tray_option, **BTN)
         cb2.pack(anchor="w", pady=(0, 4), **pad)
         if not HAVE_TRAY:
             cb2.configure(state="disabled")
 
         self.debug_var = ctk.BooleanVar(value=bool(core.VERBOSE))
         ctk.CTkCheckBox(self.body, text="Подробный журнал (для диагностики)", variable=self.debug_var,
-                        command=self.on_debug).pack(anchor="w", pady=(0, 4), **pad)
+                        command=self.on_debug, **BTN).pack(anchor="w", pady=(0, 4), **pad)
 
         # журнал
         log_head = ctk.CTkFrame(self.body, fg_color="transparent")
         log_head.pack(fill="x", pady=(10, 2), **pad)
         ctk.CTkLabel(log_head, text="Журнал").pack(side="left")
-        ctk.CTkButton(log_head, text="Папка", width=70, height=26, command=self.open_logs_folder).pack(
+        ctk.CTkButton(log_head, text="Папка", width=70, height=26, command=self.open_logs_folder, **BTN).pack(
             side="right", padx=(6, 0))
-        ctk.CTkButton(log_head, text="Копировать", width=100, height=26, command=self.copy_log).pack(side="right")
-        self.log_box = ctk.CTkTextbox(self.body, height=150, state="disabled", font=ctk.CTkFont(size=12))
+        ctk.CTkButton(log_head, text="Копировать", width=100, height=26, command=self.copy_log, **BTN).pack(side="right")
+        self.log_box = ctk.CTkTextbox(self.body, height=150, state="disabled", font=ctk.CTkFont(size=12),
+                                      fg_color=FIELD)
         self.log_box.pack(fill="x", pady=(0, 16), **pad)
 
     # ---- карточка «сейчас играет» --------------------------------------------
